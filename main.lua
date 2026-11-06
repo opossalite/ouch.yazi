@@ -160,7 +160,184 @@ local function invoke_compress_command(paths, name)
   end
 end
 
+---------------------------------------------------------------------------
+-- Decompression
+---------------------------------------------------------------------------
+
+-- Get the archives to extract: the selected files, or the hovered file if
+-- nothing is selected. Returns full paths, and whether they came from a selection.
+local get_extraction_targets = ya.sync(function()
+  local tab = cx.active
+  local paths = {}
+  local from_selection = #tab.selected > 0
+  if from_selection then
+    for _, file in pairs(tab.selected) do
+      table.insert(paths, tostring(file.url))
+    end
+  elseif tab.current.hovered then
+    table.insert(paths, tostring(tab.current.hovered.url))
+  end
+  return paths, from_selection
+end)
+
+-- Split a full path into its directory and file name
+local function split_path(path)
+  local dir, name = path:match("^(.*)[/\\]([^/\\]+)$")
+  if not name then
+    return ".", path
+  end
+  if dir == "" then
+    dir = "/"
+  end
+  return dir, name
+end
+
+-- Run ouch from `cwd` (ouch resolves its output paths relative to it).
+-- stdin is closed so ouch can never block on a prompt we can't see.
+local function run_ouch(args, cwd)
+  return Command("ouch")
+      :arg(args)
+      :cwd(cwd)
+      :stdin(Command.NULL)
+      :stdout(Command.PIPED)
+      :stderr(Command.PIPED)
+      :output()
+end
+
+local function notify_error(title, content)
+  ya.notify({
+    title = title,
+    content = content,
+    timeout = 6.0,
+    level = "error",
+  })
+end
+
+local function confirm(title)
+  local value, event = ya.input({
+    title = title,
+    pos = { "top-center", y = 3, w = 60 },
+  })
+  return event == 1 and value:lower() == "y"
+end
+
+-- From the output of `ouch l`, collect the files that already exist in `dir`.
+-- Directories (entries ending in "/") are skipped, since merging into an
+-- existing directory is normal and only files get overwritten.
+local function find_existing_files(listing, dir)
+  local existing = {}
+  local first = true
+  for line in (listing or ""):gmatch("[^\r\n]+") do
+    if first and line:find("Archive: ", 1, true) == 1 then
+      -- header line
+    elseif line:sub(-1) ~= "/" then
+      local f = io.open(dir .. "/" .. line, "r")
+      if f then
+        f:close()
+        table.insert(existing, line)
+      end
+    end
+    first = false
+  end
+  return existing
+end
+
+local function overwrite_title(existing)
+  if #existing == 1 then
+    return string.format('Overwrite "%s"? (y/N)', existing[1])
+  end
+  return string.format('Overwrite "%s" and %d more? (y/N)', existing[1], #existing - 1)
+end
+
+-- Report a failed ouch run. Returns true if everything was fine.
+local function check_result(output, err, name)
+  if err ~= nil then
+    notify_error("Failed to run ouch command", "Status: " .. tostring(err))
+    return false
+  elseif not output.status.success then
+    notify_error("Extraction failed: " .. name, output.stderr)
+    return false
+  end
+  return true
+end
+
+-- Extract one archive. Never overwrites anything without asking first.
+local function extract_one(archive, here)
+  local dir, name = split_path(archive)
+
+  if here then
+    -- `ouch d --here` overwrites existing files without asking, so look
+    -- inside the archive first and ask before touching anything.
+    local list, list_err = run_ouch({ "l", "-y", archive }, dir)
+    if list_err ~= nil then
+      notify_error("Failed to run ouch command", "Status: " .. tostring(list_err))
+      return
+    end
+
+    if list.status.success then
+      local existing = find_existing_files(list.stdout, dir)
+      if #existing > 0 and not confirm(overwrite_title(existing)) then
+        return
+      end
+      -- Conflicts are resolved (or there are none), so overwriting is intended
+      local output, err = run_ouch({ "d", "-y", "--here", archive }, dir)
+      check_result(output, err, name)
+      return
+    end
+
+    -- Single-file compressed files (foo.txt.gz) can't be listed. ouch checks
+    -- for conflicts itself in that case, handled below. Any other listing
+    -- failure means we can't tell what would be overwritten, so don't extract.
+    if not (list.stderr or ""):find("Only archives can have their contents listed", 1, true) then
+      notify_error("Cannot read " .. name, list.stderr)
+      return
+    end
+  end
+
+  -- Without -y/-n and without a terminal, ouch refuses to overwrite and
+  -- tells us so. Ask the user, and only then retry with -y.
+  local args = here and { "d", "--here", archive } or { "d", archive }
+  local output, err = run_ouch(args, dir)
+  if err == nil and output.status.success then
+    return
+  end
+
+  local stderr = output and output.stderr or ""
+  if err == nil and stderr:find("resolve file conflict", 1, true) then
+    local target = stderr:match('Handle file conflict for "(.-)":') or name
+    if confirm(string.format('"%s" exists. Overwrite? (y/N)', target)) then
+      args[#args + 1] = "-y"
+      local output2, err2 = run_ouch(args, dir)
+      check_result(output2, err2, name)
+    end
+    return
+  end
+
+  check_result(output, err, name)
+end
+
+local function extract(job)
+  ya.emit("escape", { visual = true })
+
+  local paths, from_selection = get_extraction_targets()
+  if #paths == 0 then
+    return
+  end
+
+  for _, path in ipairs(paths) do
+    extract_one(path, job.args.here)
+  end
+
+  if from_selection then
+    ya.emit("escape", {})
+  end
+end
+
 function M:entry(job)
+  if job.args.extract then
+    return extract(job)
+  end
+
   local default_fmt = job.args[1]
   if default_fmt == nil then
     default_fmt = "zip"
