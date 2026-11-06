@@ -324,8 +324,9 @@ local function extract(job)
     return
   end
 
+  local here = job.args[1] == "extract-here"
   for _, path in ipairs(paths) do
-    extract_one(path, job.args.here)
+    extract_one(path, here)
   end
 
   if from_selection then
@@ -334,7 +335,8 @@ local function extract(job)
 end
 
 function M:entry(job)
-  if job.args.extract then
+  -- `plugin ouch extract` (into a subfolder) or `plugin ouch extract-here`
+  if job.args[1] == "extract" or job.args[1] == "extract-here" then
     return extract(job)
   end
 
